@@ -8,6 +8,8 @@ from tqdm import tqdm
 import collections
 import gc
 
+import lightgbm as lgb
+
 
 def unpackbits(x, num_bits):
     """Convert a decimal value numpy.ndarray into multi-binary value numpy.ndarray ([1,2]->[[0,1],[1,0]])
@@ -205,3 +207,139 @@ class NumEncoder(object):
         gc.collect()
         vld_x = np.array(rows)
         return vld_x, vld_y
+
+
+class LightGBMRanker:
+    """LightGBM-based ranker for recommendation tasks.
+
+    Wraps LightGBM training, inference, save, and load into a single class
+    that follows a sklearn-like interface. Supports both binary classification
+    (CTR prediction) and learning-to-rank objectives (lambdarank, etc.).
+
+    Example::
+
+        ranker = LightGBMRanker(params={"objective": "binary", "metric": "auc"})
+        ranker.fit(train_x, train_y, valid_x, valid_y)
+        scores = ranker.predict(test_x)
+        ranker.save("model.lgb")
+
+        loaded = LightGBMRanker.load("model.lgb")
+        scores = loaded.predict(test_x)
+    """
+
+    DEFAULT_PARAMS = {
+        "task": "train",
+        "boosting_type": "gbdt",
+        "objective": "binary",
+        "metric": "auc",
+        "num_leaves": 64,
+        "min_data": 20,
+        "boost_from_average": True,
+        "num_threads": 4,
+        "feature_fraction": 0.8,
+        "learning_rate": 0.15,
+    }
+
+    def __init__(self, params=None, num_boost_round=100, early_stopping_rounds=20):
+        """Constructor.
+
+        Args:
+            params (dict): LightGBM parameters. Merged with DEFAULT_PARAMS; keys
+                in ``params`` take precedence.
+            num_boost_round (int): Maximum number of boosting iterations.
+            early_stopping_rounds (int): Stop training if no improvement for this
+                many rounds on the validation set. Ignored when no validation set
+                is provided.
+        """
+        self.params = {**self.DEFAULT_PARAMS, **(params or {})}
+        self.num_boost_round = num_boost_round
+        self.early_stopping_rounds = early_stopping_rounds
+        self.model = None
+
+    def fit(self, train_x, train_y, valid_x=None, valid_y=None, categorical_feature=None):
+        """Train the ranker.
+
+        Args:
+            train_x (numpy.ndarray or pandas.DataFrame): Training features.
+            train_y (numpy.ndarray): Training labels, shape ``(n,)`` or ``(n, 1)``.
+            valid_x (numpy.ndarray or pandas.DataFrame, optional): Validation features.
+            valid_y (numpy.ndarray, optional): Validation labels.
+            categorical_feature (list, optional): Column names or indices of
+                categorical features passed to LightGBM. Defaults to ``"auto"``.
+
+        Returns:
+            LightGBMRanker: self
+        """
+        cat_feat = categorical_feature or "auto"
+        lgb_train = lgb.Dataset(
+            train_x, train_y.reshape(-1), params=self.params, categorical_feature=cat_feat
+        )
+
+        valid_sets = [lgb_train]
+        callbacks = []
+        if valid_x is not None and valid_y is not None:
+            lgb_valid = lgb.Dataset(
+                valid_x,
+                valid_y.reshape(-1),
+                reference=lgb_train,
+                categorical_feature=cat_feat,
+            )
+            valid_sets.append(lgb_valid)
+            if self.early_stopping_rounds:
+                callbacks.append(lgb.early_stopping(self.early_stopping_rounds))
+
+        self.model = lgb.train(
+            self.params,
+            lgb_train,
+            num_boost_round=self.num_boost_round,
+            valid_sets=valid_sets,
+            callbacks=callbacks or None,
+        )
+        return self
+
+    def predict(self, x):
+        """Return ranking scores for the given features.
+
+        Args:
+            x (numpy.ndarray or pandas.DataFrame): Input features.
+
+        Returns:
+            numpy.ndarray: Predicted scores, shape ``(n,)``.
+        """
+        if self.model is None:
+            raise RuntimeError("Model is not trained. Call fit() or load() first.")
+        return self.model.predict(x)
+
+    def save(self, path):
+        """Save the trained model to a file.
+
+        Args:
+            path (str): Destination file path (e.g. ``"model.lgb"``).
+        """
+        if self.model is None:
+            raise RuntimeError("No trained model to save.")
+        self.model.save_model(path)
+        logging.info("LightGBMRanker model saved to %s", path)
+
+    @classmethod
+    def load(cls, path, params=None, num_boost_round=100, early_stopping_rounds=20):
+        """Load a previously saved model from a file.
+
+        Args:
+            path (str): Path to the saved model file.
+            params (dict, optional): LightGBM parameters stored on the instance
+                (not used for inference, but available for reference).
+            num_boost_round (int): Stored on the instance for reference.
+            early_stopping_rounds (int): Stored on the instance for reference.
+
+        Returns:
+            LightGBMRanker: Instance with the loaded model ready for prediction.
+        """
+        ranker = cls(
+            params=params,
+            num_boost_round=num_boost_round,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+        ranker.model = lgb.Booster(model_file=path)
+        logging.info("LightGBMRanker model loaded from %s", path)
+        return ranker
