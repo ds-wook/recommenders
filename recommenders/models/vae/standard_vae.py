@@ -137,6 +137,7 @@ class StandardVAE:
         self.drop_encoder = drop_encoder
         self.drop_decoder = drop_decoder
         self.save_path = save_path
+        self.ndcg_every = 5  # compute NDCG every N epochs; increase to reduce overhead
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -175,13 +176,12 @@ class StandardVAE:
         )
         return reconst_loss + beta * kl_loss
 
-    def _iter_batches(self, x_train: np.ndarray):
-        """Yield shuffled mini-batches for one epoch."""
-        idx = np.arange(x_train.shape[0])
-        np.random.shuffle(idx)
+    def _iter_batches(self, x_train_gpu: torch.Tensor):
+        """Yield shuffled mini-batches from a pre-loaded GPU tensor."""
+        idx = torch.randperm(x_train_gpu.shape[0], device=self.device)
         for i in range(self.number_of_batches):
             batch_idx = idx[i * self.batch_size : (i + 1) * self.batch_size]
-            yield torch.FloatTensor(x_train[batch_idx]).to(self.device)
+            yield x_train_gpu[batch_idx]
 
     def _score(self, x: np.ndarray) -> np.ndarray:
         """Run forward pass in eval mode and return numpy score matrix."""
@@ -208,6 +208,13 @@ class StandardVAE:
             x_val_te (numpy.ndarray): The click matrix for the validation set testing part.
             mapper (object): The mapper for converting click matrix to dataframe. It can be AffinityMatrix.
         """
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        # Preload datasets to GPU once to avoid repeated CPU→GPU transfers
+        x_train_gpu = torch.FloatTensor(x_train).to(self.device)
+        x_val_gpu = torch.FloatTensor(x_valid).to(self.device)
+
         self.train_loss: list[float] = []
         self.val_loss: list[float] = []
         self.val_ndcg: list[float] = []
@@ -220,7 +227,7 @@ class StandardVAE:
             # Training
             self.model.train()
             epoch_loss = 0.0
-            for batch in self._iter_batches(x_train):
+            for batch in self._iter_batches(x_train_gpu):
                 if self.annealing:
                     update_count += 1
                     self.beta = min(
@@ -236,13 +243,12 @@ class StandardVAE:
 
             avg_train_loss = epoch_loss / self.number_of_batches
 
-            # Validation loss
+            # Validation loss (already on GPU)
             self.model.eval()
             with torch.no_grad():
-                x_val_tensor = torch.FloatTensor(x_valid).to(self.device)
-                x_bar_val, z_mean_val, z_log_var_val = self.model(x_val_tensor)
+                x_bar_val, z_mean_val, z_log_var_val = self.model(x_val_gpu)
                 val_loss = self._vae_loss(
-                    x_val_tensor, x_bar_val, z_mean_val, z_log_var_val, self.beta
+                    x_val_gpu, x_bar_val, z_mean_val, z_log_var_val, self.beta
                 ).item()
 
             self.scheduler.step(val_loss)
@@ -250,11 +256,14 @@ class StandardVAE:
             self.val_loss.append(val_loss)
             self.ls_beta.append(self.beta)
 
-            # NDCG@k on validation
-            top_k = self._recommend_k_items_internal(x_val_tr, self.k, remove_seen=True)
-            top_k_df = mapper.map_back_sparse(top_k, kind="prediction")
-            test_df = mapper.map_back_sparse(x_val_te, kind="ratings")
-            ndcg = ndcg_at_k(test_df, top_k_df, col_prediction="prediction", k=self.k)
+            # NDCG@k on validation (every ndcg_every epochs)
+            if (epoch + 1) % self.ndcg_every == 0:
+                top_k = self._recommend_k_items_internal(x_val_tr, self.k, remove_seen=True)
+                top_k_df = mapper.map_back_sparse(top_k, kind="prediction")
+                test_df = mapper.map_back_sparse(x_val_te, kind="ratings")
+                ndcg = ndcg_at_k(test_df, top_k_df, col_prediction="prediction", k=self.k)
+            else:
+                ndcg = self.val_ndcg[-1] if self.val_ndcg else 0.0
             self.val_ndcg.append(ndcg)
 
             if ndcg > best_ndcg:
@@ -329,7 +338,14 @@ class StandardVAE:
             self.model.load_state_dict(
                 torch.load(self.save_path, map_location=self.device)
             )
-        return self._recommend_k_items_internal(x, k, remove_seen)
+        # Run inference on CPU to free GPU memory
+        train_device = self.device
+        self.device = torch.device("cpu")
+        self.model.to(self.device)
+        result = self._recommend_k_items_internal(x, k, remove_seen)
+        self.device = train_device
+        self.model.to(self.device)
+        return result
 
     @property
     def ndcg_per_epoch(self) -> List[float]:
